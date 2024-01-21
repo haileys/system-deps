@@ -242,6 +242,9 @@ pub enum Error {
     BuildInternalWrongVersion(String, String, String),
     /// The `cfg()` expression used in `Cargo.toml` is currently not supported
     UnsupportedCfg(String),
+    /// The link kind specified is invalid
+    /// (allowed: `static`, `static-whole-archive`, `dylib`, `framework`)
+    InvalidLinkKind(String),
 }
 
 impl From<pkg_config::Error> for Error {
@@ -286,6 +289,7 @@ impl fmt::Display for Error {
                 s1, s2, s3
             ),
             Self::UnsupportedCfg(s) => write!(f, "Unsupported cfg() expression: {}", s),
+            Self::InvalidLinkKind(kind) => write!(f, "Invalid link kind: {kind}"),
         }
     }
 }
@@ -442,12 +446,12 @@ impl Dependencies {
             lib.libs.iter().for_each(|l| {
                 flags.add(BuildFlag::Lib(
                     l.name.clone(),
-                    lib.statik && l.is_static_available,
+                    lib.kind,
                 ))
             });
             lib.frameworks
                 .iter()
-                .for_each(|f| flags.add(BuildFlag::LibFramework(f.clone())));
+                .for_each(|f| flags.add(BuildFlag::Lib(f.clone(), Some(LinkKind::Framework))));
         }
 
         // Export DEP_$CRATE_INCLUDE env variable with the headers paths,
@@ -769,11 +773,17 @@ impl Config {
             let name = &dep.key;
             let build_internal = self.get_build_internal_status(name)?;
 
-            // should the lib be statically linked?
-            let statik = self
-                .env
-                .has_value(&EnvVariable::new_link(Some(name)), "static")
-                || self.env.has_value(&EnvVariable::new_link(None), "static");
+            // what link kind should we use for library?
+            let kind = self.env.get(&EnvVariable::new_link(Some(name)))
+                .or_else(|| self.env.get(&EnvVariable::new_link(None)))
+                .map(|value| match value.as_str() {
+                    "static" => Ok(Some(LinkKind::StaticBundle)),
+                    "static-whole-archive" => Ok(Some(LinkKind::StaticWholeArchive)),
+                    "dylib" => Ok(Some(LinkKind::Dylib)),
+                    "framework" => Ok(Some(LinkKind::Framework)),
+                    _ => Err(Error::InvalidLinkKind(value))
+                })
+                .unwrap_or(Ok(None))?;
 
             let mut library = if self.env.contains(&EnvVariable::new_no_pkg_config(name)) {
                 Library::from_env_variables(name)
@@ -785,7 +795,13 @@ impl Config {
                     .print_system_libs(false)
                     .cargo_metadata(false)
                     .range_version(metadata::parse_version(version))
-                    .statik(statik);
+                    .statik(match kind {
+                        | Some(LinkKind::StaticBundle)
+                        | Some(LinkKind::StaticWholeArchive) => true,
+                        | Some(LinkKind::Dylib)
+                        | Some(LinkKind::Framework)
+                        | None => false,
+                    });
 
                 match Self::probe_with_fallback(config, lib_name, fallback_lib_names) {
                     Ok((lib_name, lib)) => Library::from_pkg_config(lib_name, lib),
@@ -803,7 +819,7 @@ impl Config {
                 }
             };
 
-            library.statik = statik;
+            library.kind = kind;
 
             libraries.add(name, library);
         }
@@ -982,8 +998,8 @@ pub struct Library {
     pub defines: HashMap<String, Option<String>>,
     /// library version
     pub version: String,
-    /// library is statically linked
-    pub statik: bool,
+    /// library link kind
+    pub kind: Option<LinkKind>,
 }
 
 impl Library {
@@ -1029,7 +1045,7 @@ impl Library {
             framework_paths: l.framework_paths,
             defines: l.defines,
             version: l.version,
-            statik: false,
+            kind: None,
         }
     }
 
@@ -1044,7 +1060,7 @@ impl Library {
             framework_paths: Vec::new(),
             defines: HashMap::new(),
             version: String::new(),
-            statik: false,
+            kind: None,
         }
     }
 
@@ -1103,7 +1119,7 @@ impl Library {
         match pkg_lib {
             Ok(pkg_lib) => {
                 let mut lib = Self::from_pkg_config(lib, pkg_lib);
-                lib.statik = true;
+                lib.kind = Some(LinkKind::StaticBundle);
                 Ok(lib)
             }
             Err(e) => Err(e.into()),
@@ -1156,8 +1172,7 @@ enum BuildFlag {
     Include(String),
     SearchNative(String),
     SearchFramework(String),
-    Lib(String, bool), // true if static
-    LibFramework(String),
+    Lib(String, Option<LinkKind>),
     RerunIfEnvChanged(EnvVariable),
 }
 
@@ -1167,17 +1182,34 @@ impl fmt::Display for BuildFlag {
             BuildFlag::Include(paths) => write!(f, "include={}", paths),
             BuildFlag::SearchNative(lib) => write!(f, "rustc-link-search=native={}", lib),
             BuildFlag::SearchFramework(lib) => write!(f, "rustc-link-search=framework={}", lib),
-            BuildFlag::Lib(lib, statik) => {
-                if *statik {
-                    write!(f, "rustc-link-lib=static={}", lib)
-                } else {
-                    write!(f, "rustc-link-lib={}", lib)
-                }
+            BuildFlag::Lib(lib, kind) => {
+                let modifier = match kind {
+                    None => "",
+                    Some(LinkKind::StaticBundle) => "static=",
+                    Some(LinkKind::StaticWholeArchive) => "static:+whole-archive=",
+                    Some(LinkKind::Dylib) => "dylib=",
+                    Some(LinkKind::Framework) => "framework=",
+                };
+
+                write!(f, "rustc-link-lib={modifier}{lib}")
             }
-            BuildFlag::LibFramework(lib) => write!(f, "rustc-link-lib=framework={}", lib),
             BuildFlag::RerunIfEnvChanged(env) => write!(f, "rerun-if-env-changed={}", env),
         }
     }
+}
+
+/// The kind of library to link, including modifiers.
+/// See https://doc.rust-lang.org/rustc/command-line-arguments.html#-l-link-the-generated-crate-to-a-native-library
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum LinkKind {
+    /// A static library linked as a bundle (the rustc default for static links)
+    StaticBundle,
+    /// A static library linked as a whole archive
+    StaticWholeArchive,
+    /// A dynamic library
+    Dylib,
+    /// A framework
+    Framework,
 }
 
 #[derive(Debug, PartialEq)]
